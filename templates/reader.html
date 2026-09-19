@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="pt-BR" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ series_title }} - Cap. {{ chapter_num }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { background-color: #06090e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .glass-nav { background: rgba(10, 15, 25, 0.92); backdrop-filter: blur(14px); border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
+        .manga-stream img { width: 100%; height: auto; display: block; margin: 0; padding: 0; }
+    </style>
+</head>
+<body class="text-gray-200 min-h-screen flex flex-col items-center">
+
+    <!-- Top Floating Header -->
+    <header class="glass-nav fixed top-0 inset-x-0 z-50 px-4 py-3 flex items-center justify-between shadow-lg">
+        <div class="flex items-center gap-3">
+            <a href="/" class="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors text-sm" title="Voltar para Biblioteca">
+                <i class="fa-solid fa-arrow-left"></i>
+            </a>
+            <div class="min-w-0">
+                <h1 class="text-sm font-bold text-white truncate max-w-[220px] sm:max-w-md">{{ series_title }}</h1>
+                <p class="text-[11px] text-indigo-400 font-medium">Capítulo {{ chapter_num }} &bull; {{ total_pages }} páginas &bull; PT-BR</p>
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <a href="/" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600/80 hover:bg-indigo-600 text-white font-medium transition-all flex items-center gap-1.5 shadow">
+                <i class="fa-solid fa-layer-group"></i> <span class="hidden sm:inline">Biblioteca</span>
+            </a>
+        </div>
+    </header>
+
+    <!-- Reading Stream -->
+    <main class="w-full max-w-[800px] mt-16 shadow-2xl shadow-black bg-black manga-stream">
+        {% for img_src in page_urls %}
+            <img src="{{ img_src }}" alt="Página {{ loop.index }}" loading="lazy">
+        {% endfor %}
+    </main>
+
+    <!-- Bottom Navigation Section -->
+    <footer class="w-full max-w-[800px] p-6 text-center space-y-6">
+        <div class="p-6 rounded-2xl bg-gray-900/80 border border-gray-800 flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div class="text-left">
+                <p class="text-xs text-gray-500 uppercase font-bold tracking-wider">Fim do Capítulo {{ chapter_num }}</p>
+                <h4 class="text-sm font-semibold text-white">O que deseja ler a seguir?</h4>
+            </div>
+            <div class="flex items-center gap-3 w-full sm:w-auto">
+                {% if prev_url %}
+                    <button onclick="handleNavigate('{{ prev_url }}')" 
+                            class="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5">
+                        <i class="fa-solid fa-chevron-left"></i> Anterior
+                    </button>
+                {% endif %}
+                <a href="/" class="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5">
+                    <i class="fa-solid fa-list"></i> Menu
+                </a>
+                {% if next_url %}
+                    <button onclick="handleNavigate('{{ next_url }}')" id="btnNext"
+                            class="flex-1 sm:flex-none px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-1.5">
+                        <span>Próximo Capítulo</span> <i class="fa-solid fa-chevron-right"></i>
+                    </button>
+                {% endif %}
+            </div>
+        </div>
+
+        <p class="text-xs text-gray-600">Traduzido automaticamente pelo Manga Translator</p>
+    </footer>
+
+    <!-- Loading Modal for Next Chapter -->
+    <div id="loadingOverlay" class="fixed inset-0 z-50 bg-black/85 backdrop-blur-md hidden flex flex-col items-center justify-center p-6 text-center">
+        <div class="w-16 h-16 rounded-2xl bg-gradient-to-tr from-indigo-600 to-purple-500 flex items-center justify-center text-white text-2xl shadow-2xl shadow-indigo-500/30 animate-bounce mb-4">
+            <i class="fa-solid fa-bolt"></i>
+        </div>
+        <h3 id="overlayTitle" class="text-lg font-bold text-white mb-2">Traduzindo Próximo Capítulo...</h3>
+        <p id="overlayMsg" class="text-xs text-gray-400 max-w-sm mb-6">Baixando páginas e aplicando inteligência artificial em português.</p>
+        <div class="w-64 h-2.5 bg-gray-800 rounded-full overflow-hidden p-0.5">
+            <div id="overlayBar" class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-300 w-0"></div>
+        </div>
+    </div>
+
+    <!-- Floating Scroll To Top -->
+    <button onclick="window.scrollTo({top: 0, behavior: 'smooth'})"
+            class="fixed bottom-6 right-6 w-11 h-11 rounded-full bg-gray-900/90 hover:bg-indigo-600 text-white shadow-xl flex items-center justify-center text-sm border border-gray-700 transition-all">
+        <i class="fa-solid fa-arrow-up"></i>
+    </button>
+
+    <script>
+        async function handleNavigate(url) {
+            const overlay = document.getElementById('loadingOverlay');
+            const overlayMsg = document.getElementById('overlayMsg');
+            const overlayBar = document.getElementById('overlayBar');
+
+            overlay.classList.remove('hidden');
+            overlay.classList.add('flex');
+            overlayBar.style.width = '10%';
+
+            try {
+                const res = await fetch('/api/translate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await res.json();
+                const jobId = data.job_id;
+
+                const timer = setInterval(async () => {
+                    const statusRes = await fetch(`/api/progress?job_id=${jobId}`);
+                    const statusData = await statusRes.json();
+
+                    overlayBar.style.width = `${statusData.percent}%`;
+                    overlayMsg.textContent = statusData.message;
+
+                    if (statusData.status === 'completed') {
+                        clearInterval(timer);
+                        window.location.href = `/read?series=${encodeURIComponent(statusData.series_slug)}&chapter=${encodeURIComponent(statusData.chapter_num)}`;
+                    } else if (statusData.status === 'error') {
+                        clearInterval(timer);
+                        alert("Erro ao carregar capítulo: " + statusData.message);
+                        overlay.classList.add('hidden');
+                        overlay.classList.remove('flex');
+                    }
+                }, 1000);
+            } catch (err) {
+                alert("Erro ao conectar: " + err.message);
+                overlay.classList.add('hidden');
+                overlay.classList.remove('flex');
+            }
+        }
+    </script>
+</body>
+</html>

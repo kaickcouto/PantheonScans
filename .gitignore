@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# User downloaded mangas and local data
+data/
+downloads/
+*.webp
+*.png
+!templates/*.png
+
+# IDE / Editor files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
