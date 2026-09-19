@@ -1,4 +1,4 @@
-# ⚡ Manga Translator Web
+# ⚡ PantheonScans Web
 
 > Leitor e tradutor automático de mangás, manhwas e webtoons com interface web moderna, motor Turbo em nuvem e zero necessidade de placa de vídeo dedicada.
 
@@ -26,8 +26,8 @@ Certifique-se de ter o **Python 3.10+** instalado em seu sistema.
 
 ### 2. Clonar o repositório
 ```bash
-git clone https://github.com/SEU_USUARIO/manga-translator-web.git
-cd manga-translator-web
+git clone https://github.com/kaickcouto/PantheonScans.git
+cd PantheonScans
 ```
 
 ### 3. Instalar dependências
