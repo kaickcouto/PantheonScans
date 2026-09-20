@@ -8,16 +8,31 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         body { background-color: #06090e; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .theme-navy { background-color: #06090e !important; }
+        .theme-oled { background-color: #000000 !important; }
+        .theme-charcoal { background-color: #18181b !important; }
+        .gap-spaced img { margin-bottom: 8px !important; }
         .glass-nav { background: rgba(10, 15, 25, 0.92); backdrop-filter: blur(14px); border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
-        .manga-stream img { width: 100%; height: auto; display: block; margin: 0; padding: 0; }
+        .manga-stream img {
+            width: 100%;
+            height: auto;
+            display: block;
+            margin: 0;
+            padding: 0;
+            content-visibility: auto;
+            contain-intrinsic-size: 700px 3000px;
+        }
     </style>
 </head>
-<body class="text-gray-200 min-h-screen flex flex-col items-center">
+<body class="text-gray-200 min-h-screen flex flex-col items-center theme-navy">
+
+    <!-- Top Reading Progress Indicator -->
+    <div id="readProgress" class="fixed top-0 left-0 h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-indigo-400 z-[60] transition-all w-0 pointer-events-none"></div>
 
     <!-- Top Floating Header -->
     <header class="glass-nav fixed top-0 inset-x-0 z-50 px-4 py-3 flex items-center justify-between shadow-lg">
         <div class="flex items-center gap-3">
-            <a href="/" class="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors text-sm" title="Voltar para Biblioteca">
+            <a href="/?series={{ series_slug }}" class="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 text-white flex items-center justify-center transition-colors text-sm" title="Voltar para a Obra">
                 <i class="fa-solid fa-arrow-left"></i>
             </a>
             <div class="min-w-0">
@@ -26,6 +41,31 @@
             </div>
         </div>
         <div class="flex items-center gap-2">
+            <!-- Badge de Prefetch em Segundo Plano -->
+            <span id="prefetchBadge" class="hidden text-[10px] text-indigo-300 bg-indigo-950/80 border border-indigo-700/50 px-2.5 py-1 rounded-full font-medium items-center gap-1.5 transition-all">
+                <i class="fa-solid fa-spinner fa-spin text-indigo-400" id="prefetchIcon"></i>
+                <span id="prefetchText" class="hidden sm:inline">Traduzindo próx. cap. em 2º plano (<span id="prefetchPct">0%</span>)</span>
+            </span>
+            <!-- Botao Tema de Fundo -->
+            <button onclick="cycleTheme()" class="text-xs px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center gap-1" title="Alternar Tema de Fundo (Atalho: T)">
+                <i class="fa-solid fa-palette text-indigo-400"></i> <span id="themeLabel" class="hidden sm:inline">Navy</span>
+            </button>
+            <!-- Botao Espaçamento (Gap) -->
+            <button onclick="toggleGap()" class="text-xs px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center gap-1" title="Alternar Espaçamento (Atalho: G)">
+                <i class="fa-solid fa-grip-lines text-indigo-400"></i> <span id="gapLabel" class="hidden sm:inline">0px</span>
+            </button>
+            <!-- Botao Largura -->
+            <button onclick="cycleWidth()" class="text-xs px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center gap-1" title="Ajustar Largura (Atalho: W)">
+                <i class="fa-solid fa-arrows-left-right text-indigo-400"></i> <span id="widthLabel" class="hidden sm:inline">800px</span>
+            </button>
+            <!-- Botao Tela Cheia -->
+            <button onclick="toggleFullscreen()" class="text-xs px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium transition-all flex items-center gap-1" title="Tela Cheia (Atalho: F)">
+                <i class="fa-solid fa-expand"></i>
+            </button>
+            <!-- Botao Baixar CBZ -->
+            <a href="/api/export/cbz?series={{ series_slug }}&chapter={{ chapter_num }}" download class="text-xs px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-emerald-600 text-white font-medium transition-all flex items-center gap-1" title="Baixar Capítulo em .CBZ">
+                <i class="fa-solid fa-file-zipper"></i> <span class="hidden md:inline">.CBZ</span>
+            </a>
             <a href="/" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600/80 hover:bg-indigo-600 text-white font-medium transition-all flex items-center gap-1.5 shadow">
                 <i class="fa-solid fa-layer-group"></i> <span class="hidden sm:inline">Biblioteca</span>
             </a>
@@ -33,7 +73,7 @@
     </header>
 
     <!-- Reading Stream -->
-    <main class="w-full max-w-[800px] mt-16 shadow-2xl shadow-black bg-black manga-stream">
+    <main id="mangaStream" class="w-full max-w-[800px] mt-16 shadow-2xl shadow-black bg-black manga-stream">
         {% for img_src in page_urls %}
             <img src="{{ img_src }}" alt="Página {{ loop.index }}" loading="lazy">
         {% endfor %}
@@ -48,7 +88,7 @@
             </div>
             <div class="flex items-center gap-3 w-full sm:w-auto">
                 {% if prev_url %}
-                    <button onclick="handleNavigate('{{ prev_url }}')" 
+                    <button onclick="handleNavigate('{{ prev_url }}')" id="btnPrev"
                             class="flex-1 sm:flex-none px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 text-white text-xs font-semibold transition-all flex items-center justify-center gap-1.5">
                         <i class="fa-solid fa-chevron-left"></i> Anterior
                     </button>
@@ -57,7 +97,7 @@
                     <i class="fa-solid fa-list"></i> Menu
                 </a>
                 {% if next_url %}
-                    <button onclick="handleNavigate('{{ next_url }}')" id="btnNext"
+                    <button onclick="handleNavigate('{{ next_url }}')" id="btnNext" data-next-url="{{ next_url }}"
                             class="flex-1 sm:flex-none px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-1.5">
                         <span>Próximo Capítulo</span> <i class="fa-solid fa-chevron-right"></i>
                     </button>
@@ -80,14 +120,108 @@
         </div>
     </div>
 
+    <!-- Floating Page Indicator Pill -->
+    <div id="pagePill" class="fixed bottom-6 left-6 z-40 bg-gray-900/90 hover:bg-gray-800 backdrop-blur-md border border-gray-700/80 px-3.5 py-1.5 rounded-full text-xs font-semibold text-gray-200 shadow-xl flex items-center gap-2 select-none transition-all">
+        <i class="fa-regular fa-image text-indigo-400"></i>
+        <span id="currentPageText">Página 1</span>
+        <span class="text-gray-500">/</span>
+        <span id="totalPageText">{{ total_pages }}</span>
+    </div>
+
     <!-- Floating Scroll To Top -->
     <button onclick="window.scrollTo({top: 0, behavior: 'smooth'})"
-            class="fixed bottom-6 right-6 w-11 h-11 rounded-full bg-gray-900/90 hover:bg-indigo-600 text-white shadow-xl flex items-center justify-center text-sm border border-gray-700 transition-all">
+            class="fixed bottom-6 right-6 w-11 h-11 rounded-full bg-gray-900/90 hover:bg-indigo-600 text-white shadow-xl flex items-center justify-center text-sm border border-gray-700 transition-all" title="Rolar para o topo">
         <i class="fa-solid fa-arrow-up"></i>
     </button>
 
     <script>
+        let prefetchTriggered = false;
+        let prefetchCompleted = false;
+        let prefetchSeriesSlug = null;
+        let prefetchChapterNum = null;
+
+        function markPrefetchDone(sSlug, cNum) {
+            prefetchCompleted = true;
+            prefetchSeriesSlug = sSlug;
+            prefetchChapterNum = cNum;
+
+            const badge = document.getElementById('prefetchBadge');
+            if (badge) {
+                badge.className = "flex text-[10px] text-emerald-300 bg-emerald-950/80 border border-emerald-600/50 px-2.5 py-1 rounded-full font-semibold items-center gap-1.5 shadow-sm transition-all";
+                badge.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-400"></i><span class="hidden sm:inline">Próximo capítulo pronto!</span>`;
+            }
+
+            const btnNext = document.getElementById('btnNext');
+            if (btnNext) {
+                btnNext.classList.remove('bg-indigo-600', 'hover:bg-indigo-500', 'shadow-indigo-600/30');
+                btnNext.classList.add('bg-emerald-600', 'hover:bg-emerald-500', 'shadow-emerald-600/30', 'ring-2', 'ring-emerald-400/50');
+                const span = btnNext.querySelector('span');
+                if (span) span.textContent = 'Próximo Capítulo (Pronto)';
+            }
+        }
+
+        async function prefetchNext() {
+            const btnNext = document.getElementById('btnNext');
+            const nextUrl = btnNext ? btnNext.getAttribute('data-next-url') : null;
+            if (!nextUrl || prefetchTriggered) return;
+            prefetchTriggered = true;
+
+            const badge = document.getElementById('prefetchBadge');
+            const pct = document.getElementById('prefetchPct');
+
+            if (badge) {
+                badge.classList.remove('hidden');
+                badge.classList.add('flex');
+            }
+
+            try {
+                const res = await fetch('/api/translate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: nextUrl })
+                });
+                const data = await res.json();
+
+                if (data.already_completed) {
+                    markPrefetchDone(data.series_slug, data.chapter_num);
+                    return;
+                }
+
+                const jobId = data.job_id;
+                if (!jobId) return;
+
+                const pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch(`/api/progress?job_id=${jobId}`);
+                        const statusData = await statusRes.json();
+
+                        if (pct) pct.textContent = `${statusData.percent}%`;
+
+                        if (statusData.status === 'completed') {
+                            clearInterval(pollInterval);
+                            markPrefetchDone(statusData.series_slug, statusData.chapter_num);
+                        } else if (statusData.status === 'error') {
+                            clearInterval(pollInterval);
+                            if (badge) badge.classList.add('hidden');
+                        }
+                    } catch (e) {
+                        clearInterval(pollInterval);
+                    }
+                }, 1500);
+
+            } catch (err) {
+                console.log('Prefetch silencioso ignorado:', err);
+                if (badge) badge.classList.add('hidden');
+            }
+        }
+
         async function handleNavigate(url) {
+            // Se já foi traduzido previamente em 2º plano, abre instantaneamente com 0 delay
+            if (prefetchCompleted && prefetchSeriesSlug && prefetchChapterNum) {
+                window.location.href = `/read?series=${encodeURIComponent(prefetchSeriesSlug)}&chapter=${encodeURIComponent(prefetchChapterNum)}`;
+                return;
+            }
+
             const overlay = document.getElementById('loadingOverlay');
             const overlayMsg = document.getElementById('overlayMsg');
             const overlayBar = document.getElementById('overlayBar');
@@ -103,6 +237,12 @@
                     body: JSON.stringify({ url })
                 });
                 const data = await res.json();
+
+                if (data.already_completed) {
+                    window.location.href = `/read?series=${encodeURIComponent(data.series_slug)}&chapter=${encodeURIComponent(data.chapter_num)}`;
+                    return;
+                }
+
                 const jobId = data.job_id;
 
                 const timer = setInterval(async () => {
@@ -128,6 +268,170 @@
                 overlay.classList.remove('flex');
             }
         }
+
+        // Controle dinamico de largura da leitura
+        const widths = ['max-w-[650px]', 'max-w-[800px]', 'max-w-[1000px]', 'max-w-none'];
+        const widthLabels = ['650px', '800px', '1000px', '100%'];
+        let currentWidthIdx = 1;
+
+        function setWidthIdx(idx) {
+            const main = document.getElementById('mangaStream');
+            main.classList.remove(...widths);
+            currentWidthIdx = (idx + widths.length) % widths.length;
+            main.classList.add(widths[currentWidthIdx]);
+            document.getElementById('widthLabel').textContent = widthLabels[currentWidthIdx];
+        }
+
+        function cycleWidth() {
+            setWidthIdx(currentWidthIdx + 1);
+        }
+
+        // Temas de Fundo (Navy, OLED Preto Puro, Charcoal)
+        const themes = ['theme-navy', 'theme-oled', 'theme-charcoal'];
+        const themeLabels = ['Navy', 'OLED', 'Charcoal'];
+        let currentThemeIdx = 0;
+
+        function applyTheme(idx) {
+            currentThemeIdx = (idx + themes.length) % themes.length;
+            document.body.classList.remove('theme-navy', 'theme-oled', 'theme-charcoal');
+            document.body.classList.add(themes[currentThemeIdx]);
+            const lbl = document.getElementById('themeLabel');
+            if (lbl) lbl.textContent = themeLabels[currentThemeIdx];
+            localStorage.setItem('pantheon_theme', currentThemeIdx);
+        }
+
+        function cycleTheme() {
+            applyTheme(currentThemeIdx + 1);
+        }
+
+        // Espaçamento entre Quadros (Gap)
+        let isSpaced = false;
+        function toggleGap() {
+            isSpaced = !isSpaced;
+            const stream = document.getElementById('mangaStream');
+            const lbl = document.getElementById('gapLabel');
+            if (isSpaced) {
+                stream.classList.add('gap-spaced');
+                if (lbl) lbl.textContent = '8px';
+            } else {
+                stream.classList.remove('gap-spaced');
+                if (lbl) lbl.textContent = '0px';
+            }
+            localStorage.setItem('pantheon_gap', isSpaced ? '1' : '0');
+        }
+
+        // Modo Tela Cheia
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(err => console.log(err));
+            } else {
+                document.exitFullscreen().catch(err => console.log(err));
+            }
+        }
+
+        // Posição de Leitura Persistente (localStorage)
+        const seriesSlug = "{{ series_slug }}";
+        const chapterNum = "{{ chapter_num }}";
+        const scrollKey = `pantheon_pos_${seriesSlug}_${chapterNum}`;
+
+        window.addEventListener('DOMContentLoaded', () => {
+            // Restaura tema e gap salvos
+            const savedTheme = localStorage.getItem('pantheon_theme');
+            if (savedTheme !== null) applyTheme(parseInt(savedTheme, 10));
+
+            const savedGap = localStorage.getItem('pantheon_gap');
+            if (savedGap === '1') toggleGap();
+
+            const saved = localStorage.getItem(scrollKey);
+            if (saved) {
+                const y = parseInt(saved, 10);
+                if (y > 100) {
+                    setTimeout(() => {
+                        window.scrollTo({ top: y, behavior: 'smooth' });
+                    }, 350);
+                }
+            }
+
+            // Rastreamento dinâmico da página atual visível
+            const pageImages = document.querySelectorAll('#mangaStream img');
+            if (pageImages.length > 0 && 'IntersectionObserver' in window) {
+                const pageObserver = new IntersectionObserver((entries) => {
+                    entries.forEach(entry => {
+                        if (entry.isIntersecting) {
+                            const idx = Array.from(pageImages).indexOf(entry.target) + 1;
+                            if (idx > 0) {
+                                const curEl = document.getElementById('currentPageText');
+                                if (curEl) curEl.textContent = `Página ${idx}`;
+                                // Salva estado de leitura global
+                                const readingState = {
+                                    seriesSlug: seriesSlug,
+                                    seriesTitle: "{{ series_title }}",
+                                    chapterNum: chapterNum,
+                                    currentPage: idx,
+                                    totalPages: {{ total_pages }},
+                                    updatedAt: Date.now()
+                                };
+                                localStorage.setItem('pantheon_last_read', JSON.stringify(readingState));
+                            }
+                        }
+                    });
+                }, { rootMargin: '-25% 0px -45% 0px' });
+
+                pageImages.forEach(img => pageObserver.observe(img));
+            }
+
+            // Inicia automaticamente a tradução em background do próximo capítulo após 2 segundos
+            setTimeout(() => {
+                prefetchNext();
+            }, 2000);
+        });
+
+        let savePosTimer = null;
+
+        // Barra de progresso de leitura conforme rola a pagina
+        window.addEventListener('scroll', () => {
+            const totalHeight = document.documentElement.scrollHeight - window.innerHeight;
+            const progress = totalHeight > 0 ? (window.scrollY / totalHeight) * 100 : 0;
+            const bar = document.getElementById('readProgress');
+            if (bar) bar.style.width = `${progress}%`;
+
+            // Salva posição no localStorage com debounce (250ms)
+            clearTimeout(savePosTimer);
+            savePosTimer = setTimeout(() => {
+                localStorage.setItem(scrollKey, window.scrollY);
+            }, 250);
+        });
+
+        // Navegação rápida com teclado:
+        // Setas = Anterior/Próximo, F = Tela Cheia, W = Largura, T = Tema, G = Espaçamento, J/K = Rolar
+        window.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            if (e.key === 'ArrowRight') {
+                const btnNext = document.getElementById('btnNext');
+                if (btnNext) btnNext.click();
+            } else if (e.key === 'ArrowLeft') {
+                const btnPrev = document.getElementById('btnPrev');
+                if (btnPrev) btnPrev.click();
+            } else if (e.key.toLowerCase() === 'f') {
+                toggleFullscreen();
+            } else if (e.key.toLowerCase() === 'w') {
+                cycleWidth();
+            } else if (e.key.toLowerCase() === 't') {
+                cycleTheme();
+            } else if (e.key.toLowerCase() === 'g') {
+                toggleGap();
+            } else if (e.key === '+' || e.key === '=') {
+                setWidthIdx(currentWidthIdx + 1);
+            } else if (e.key === '-' || e.key === '_') {
+                setWidthIdx(currentWidthIdx - 1);
+            } else if (e.key.toLowerCase() === 'j' || (e.key === ' ' && !e.shiftKey)) {
+                e.preventDefault();
+                window.scrollBy({ top: window.innerHeight * 0.7, behavior: 'smooth' });
+            } else if (e.key.toLowerCase() === 'k' || (e.key === ' ' && e.shiftKey)) {
+                e.preventDefault();
+                window.scrollBy({ top: -window.innerHeight * 0.7, behavior: 'smooth' });
+            }
+        });
     </script>
 </body>
 </html>

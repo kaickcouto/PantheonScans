@@ -1,0 +1,9 @@
+{
+  "name": "pantheon-scans",
+  "version": "1.0.0",
+  "description": "PantheonScans Web - Manga & Webtoon Translator",
+  "scripts": {
+    "dev": "python app.py",
+    "start": "python app.py"
+  }
+}
