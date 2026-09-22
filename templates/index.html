@@ -46,6 +46,38 @@
     <!-- Main Container -->
     <main class="flex-1 max-w-5xl w-full mx-auto p-6 space-y-8">
 
+        <!-- Update Notification Banner -->
+        <div id="updateBanner" class="hidden glass rounded-2xl p-4 sm:p-5 border border-amber-500/40 bg-gradient-to-r from-amber-950/40 via-yellow-950/25 to-gray-900/60 shadow-xl shadow-amber-950/20 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 transition-all">
+            <div class="flex items-center gap-3.5">
+                <div class="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 text-lg shrink-0">
+                    <i class="fa-solid fa-cloud-arrow-down animate-bounce"></i>
+                </div>
+                <div>
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="text-[11px] uppercase font-bold text-amber-400 tracking-wider flex items-center gap-1.5">
+                            <span class="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                            Nova Versão Disponível
+                        </span>
+                        <span id="updateVersionBadge" class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30"></span>
+                    </div>
+                    <p id="updateMessage" class="text-xs text-gray-300 mt-1 max-w-xl">Uma nova versão do PantheonScans foi publicada no GitHub.</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2 shrink-0 w-full sm:w-auto justify-end">
+                <button id="btnAutoUpdate" onclick="triggerAutoUpdate()" class="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 active:scale-95 text-black text-xs font-bold transition-all shadow-md shadow-amber-500/20 flex items-center gap-2">
+                    <i class="fa-solid fa-arrows-rotate" id="updateIcon"></i>
+                    <span id="updateBtnText">Atualizar Agora</span>
+                </button>
+                <a id="btnGitHubRelease" href="https://github.com/kaickcouto/PantheonScans" target="_blank" class="px-3.5 py-2 rounded-xl bg-gray-800/80 hover:bg-gray-700 text-gray-300 text-xs font-semibold transition-all border border-gray-700 flex items-center gap-1.5">
+                    <i class="fa-brands fa-github"></i>
+                    <span>GitHub</span>
+                </a>
+                <button onclick="dismissUpdate()" title="Fechar aviso" class="text-gray-400 hover:text-white p-2 text-sm rounded-lg hover:bg-white/5 transition-all">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
+        </div>
+
         <!-- Continue Reading Banner (Dynamically shown from localStorage) -->
         <div id="continueReadingCard" class="hidden glass rounded-2xl p-5 border border-indigo-500/30 bg-gradient-to-r from-indigo-950/40 via-purple-950/20 to-gray-900/40 shadow-lg flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
             <div class="flex items-center gap-3.5">
@@ -487,9 +519,77 @@
             } catch (e) {}
         }
 
+        // Verificação de Atualização do GitHub
+        async function checkAppUpdate() {
+            if (sessionStorage.getItem('pantheon_update_dismissed') === 'true') return;
+            try {
+                const res = await fetch('/api/check_update');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (data.has_update) {
+                    const banner = document.getElementById('updateBanner');
+                    const badge = document.getElementById('updateVersionBadge');
+                    const msg = document.getElementById('updateMessage');
+                    if (banner && badge && msg) {
+                        badge.textContent = data.remote_commit ? `#${data.remote_commit}` : `v${data.remote_version}`;
+                        if (data.commit_message) {
+                            msg.textContent = data.commit_message;
+                        }
+                        banner.classList.remove('hidden');
+                    }
+                }
+            } catch (e) {
+                console.log('Update check skipped:', e);
+            }
+        }
+
+        async function triggerAutoUpdate() {
+            const btn = document.getElementById('btnAutoUpdate');
+            const icon = document.getElementById('updateIcon');
+            const text = document.getElementById('updateBtnText');
+            if (!btn) return;
+
+            btn.disabled = true;
+            icon.classList.add('fa-spin');
+            text.textContent = 'Atualizando...';
+
+            try {
+                const res = await fetch('/api/update', { method: 'POST' });
+                const result = await res.json();
+                if (result.success) {
+                    alert('✅ ' + result.message);
+                    window.location.reload();
+                } else if (result.manual && result.download_url) {
+                    if (confirm(result.message + '\n\nDeseja abrir a página de download no GitHub?')) {
+                        window.open(result.download_url, '_blank');
+                    }
+                    btn.disabled = false;
+                    icon.classList.remove('fa-spin');
+                    text.textContent = 'Atualizar Agora';
+                } else {
+                    alert('⚠️ ' + result.message);
+                    btn.disabled = false;
+                    icon.classList.remove('fa-spin');
+                    text.textContent = 'Atualizar Agora';
+                }
+            } catch (err) {
+                alert('Erro na comunicação com o servidor: ' + err.message);
+                btn.disabled = false;
+                icon.classList.remove('fa-spin');
+                text.textContent = 'Atualizar Agora';
+            }
+        }
+
+        function dismissUpdate() {
+            const banner = document.getElementById('updateBanner');
+            if (banner) banner.classList.add('hidden');
+            sessionStorage.setItem('pantheon_update_dismissed', 'true');
+        }
+
         // Carrega biblioteca ao iniciar
         loadLibrary();
         checkContinueReading();
+        checkAppUpdate();
     </script>
 </body>
 </html>

@@ -7,6 +7,8 @@ import uuid
 import threading
 import asyncio
 import webbrowser
+import subprocess
+import time
 from engine import MangaEngine
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +19,121 @@ engine = MangaEngine(data_dir=DATA_DIR)
 
 # Estado dos jobs de traducao em memoria
 JOBS = {}
+
+LAST_UPDATE_CHECK = 0
+CACHED_UPDATE_INFO = None
+
+def check_update(base_dir, force=False):
+    global LAST_UPDATE_CHECK, CACHED_UPDATE_INFO
+    now = time.time()
+    if not force and CACHED_UPDATE_INFO and (now - LAST_UPDATE_CHECK < 300):
+        return CACHED_UPDATE_INFO
+
+    local_version = "1.0.0"
+    pkg_path = os.path.join(base_dir, "package.json")
+    if os.path.exists(pkg_path):
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as f:
+                local_version = json.load(f).get("version", "1.0.0")
+        except Exception:
+            pass
+
+    is_git = os.path.exists(os.path.join(base_dir, ".git"))
+    local_commit = None
+    if is_git:
+        try:
+            res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if res.returncode == 0 and res.stdout:
+                local_commit = res.stdout.strip()
+        except Exception:
+            pass
+
+    repo = "kaickcouto/PantheonScans"
+    remote_commit = None
+    commit_message = None
+    commit_date = None
+    has_update = False
+
+    try:
+        cmd = ["curl.exe", "-s", "-H", "User-Agent: PantheonScans-App", f"https://api.github.com/repos/{repo}/commits/main"]
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            remote_commit = data.get("sha")
+            commit_obj = data.get("commit", {})
+            commit_message = commit_obj.get("message", "").splitlines()[0] if commit_obj.get("message") else ""
+            commit_date = commit_obj.get("author", {}).get("date")
+    except Exception:
+        pass
+
+    remote_version = local_version
+    try:
+        cmd_v = ["curl.exe", "-s", f"https://raw.githubusercontent.com/{repo}/main/package.json"]
+        res_v = subprocess.run(cmd_v, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        if res_v.returncode == 0 and res_v.stdout:
+            pkg_rem = json.loads(res_v.stdout)
+            remote_version = pkg_rem.get("version", local_version)
+    except Exception:
+        pass
+
+    if local_commit and remote_commit:
+        has_update = (local_commit != remote_commit)
+    elif remote_version and local_version:
+        has_update = (remote_version != local_version)
+
+    info = {
+        "has_update": has_update,
+        "local_version": local_version,
+        "remote_version": remote_version,
+        "local_commit": local_commit[:7] if local_commit else None,
+        "remote_commit": remote_commit[:7] if remote_commit else None,
+        "commit_message": commit_message,
+        "commit_date": commit_date,
+        "is_git": is_git,
+        "repo_url": f"https://github.com/{repo}"
+    }
+
+    LAST_UPDATE_CHECK = now
+    CACHED_UPDATE_INFO = info
+    return info
+
+def apply_update(base_dir):
+    is_git = os.path.exists(os.path.join(base_dir, ".git"))
+    if not is_git:
+        return {
+            "success": False,
+            "manual": True,
+            "download_url": "https://github.com/kaickcouto/PantheonScans/archive/refs/heads/main.zip",
+            "message": "Instalação sem Git detectada. Baixe a versão mais recente em formato ZIP no repositório."
+        }
+
+    try:
+        res = subprocess.run(["git", "pull", "origin", "main"], cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        if res.returncode != 0:
+            return {
+                "success": False,
+                "message": f"Erro no git pull: {res.stderr or res.stdout}"
+            }
+
+        try:
+            subprocess.run(["pip", "install", "-r", "requirements.txt", "--quiet"], cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        global CACHED_UPDATE_INFO, LAST_UPDATE_CHECK
+        CACHED_UPDATE_INFO = None
+        LAST_UPDATE_CHECK = 0
+
+        return {
+            "success": True,
+            "message": "PantheonScans atualizado com sucesso para a versão mais recente do GitHub! Reinicie o servidor para carregar as alterações.",
+            "output": res.stdout.strip()
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Falha ao executar atualização: {str(e)}"
+        }
 
 def run_async_task(coro):
     """Executa uma corotina asyncio em uma nova thread"""
@@ -125,6 +242,18 @@ class MangaAppHandler(http.server.BaseHTTPRequestHandler):
             job_id = query.get("job_id", [None])[0]
             job = JOBS.get(job_id, {"status": "error", "percent": 0, "message": "Job não encontrado"})
             res_json = json.dumps(job, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(res_json)))
+            self.end_headers()
+            self.wfile.write(res_json)
+            return
+
+        # 3.2 Rota de Verificação de Atualização (GitHub)
+        if path == "/api/check_update":
+            force = query.get("force", ["0"])[0] in ["1", "true"]
+            info = check_update(BASE_DIR, force=force)
+            res_json = json.dumps(info, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(res_json)))
@@ -345,6 +474,17 @@ class MangaAppHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        # Rota de Auto Update
+        if path == "/api/update":
+            result = apply_update(BASE_DIR)
+            res_json = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(res_json)))
+            self.end_headers()
+            self.wfile.write(res_json)
+            return
 
         if path == "/api/translate":
             length = int(self.headers.get('Content-Length', 0))

@@ -1,8 +1,15 @@
 import json
 import re
 import os
+import base64
 import asyncio
 import urllib.parse
+import subprocess
+import socket
+import struct
+import zlib
+import shutil
+from datetime import datetime, timezone
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 from chrome_lens_py import LensAPI
@@ -522,41 +529,32 @@ def _save_translation_cache():
 
 _load_translation_cache()
 
-# 6. Tradução Contextual Híbrida (Cache -> Google GTX -> MyMemory Fallback)
+# 6. Tradução Contextual Híbrida (Cache -> Google GTX com detecção automática de idioma)
 async def translate_gtx_sentence(client, text):
     if not text or len(text.strip()) < 2:
-        return text
+        return None
 
     cleaned = clean_ocr_artifacts(text)
     cache_key = cleaned.lower().strip()
     if cache_key in _TRANSLATION_CACHE:
-        return _TRANSLATION_CACHE[cache_key]
+        cached = _TRANSLATION_CACHE[cache_key]
+        if cached and cached.strip().lower() != cache_key:
+            return cached
 
-    # 1. Tentativa Primária: Google GTX com detecção automática de origem
+    # Tentativa Google GTX com detecção automática de origem (qualquer idioma -> pt)
     url_gtx = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=pt&dt=t&q=" + urllib.parse.quote(cleaned)
     try:
         res = await client.get(url_gtx, headers={"User-Agent": "Mozilla/5.0"}, timeout=7.0)
-        data = res.json()
-        translated = "".join([p[0] for p in data[0] if p[0]])
-        if translated and len(translated.strip()) > 0:
-            _TRANSLATION_CACHE[cache_key] = translated
-            return translated
+        if res.status_code == 200:
+            data = res.json()
+            translated = "".join([p[0] for p in data[0] if p[0]])
+            if translated and len(translated.strip()) > 0 and translated.strip().lower() != cache_key:
+                _TRANSLATION_CACHE[cache_key] = translated
+                return translated
     except Exception:
         pass
 
-    # 2. Fallback de Alta Disponibilidade: MyMemory Translation API
-    try:
-        url_mm = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(cleaned)}&langpair=en|pt-BR"
-        res_mm = await client.get(url_mm, headers={"User-Agent": "Mozilla/5.0"}, timeout=6.0)
-        data_mm = res_mm.json()
-        translated = data_mm.get("responseData", {}).get("translatedText")
-        if translated and len(translated.strip()) > 0:
-            _TRANSLATION_CACHE[cache_key] = translated
-            return translated
-    except Exception:
-        pass
-
-    return text
+    return None
 
 def polish_scanlation_text(text, glossary=None):
     if not text:
@@ -755,7 +753,7 @@ class MangaEngine:
         return text
 
     async def refine_scanlation_objects(self, raw_objs, glossary, gtx_client):
-        """Traduz sentenças contextualmente via GTX, filtra marcas d'água e ativa reflow inteligente de balão"""
+        """Traduz e refina sentenças via Lens/GTX multilíngue, filtra marcas d'água e ativa reflow inteligente"""
         if not raw_objs or not raw_objs.text:
             return
 
@@ -778,48 +776,434 @@ class MangaEngine:
                     raw_objs.deep_gleams[p_idx].translation.translation = ""
                     raw_objs.deep_gleams[p_idx].translation.line.clear()
                 continue
-            para_indices.append(p_idx)
-            tasks.append(translate_gtx_sentence(gtx_client, src))
+
+            # 1. Verifica se o Google Lens já traduziu nativamente para português (multilíngue de alta precisão)
+            lens_trans = ""
+            has_lens_trans = False
+            if p_idx < len(raw_objs.deep_gleams) and raw_objs.deep_gleams[p_idx].HasField("translation"):
+                lens_trans = raw_objs.deep_gleams[p_idx].translation.translation.strip()
+                if lens_trans and lens_trans.lower() != src.lower():
+                    has_lens_trans = True
+
+            if has_lens_trans:
+                # O Google Lens já traduziu o idioma (Francês, Japonês, Coreano, Inglês, etc.)
+                polished = polish_scanlation_text(lens_trans, glossary)
+                raw_objs.deep_gleams[p_idx].translation.translation = polished
+                raw_objs.deep_gleams[p_idx].translation.writing_direction = 2  # Ativa reflow de balão
+                raw_objs.deep_gleams[p_idx].translation.target_language = "pt"
+                raw_objs.deep_gleams[p_idx].translation.status.code = 1
+            else:
+                # Fallback: só requisita GTX se o Lens não traduziu este parágrafo
+                para_indices.append(p_idx)
+                tasks.append(translate_gtx_sentence(gtx_client, src))
+
+            # Assegura que o parágrafo tenha bounding box de geometria para reflow
+            if not para.HasField("geometry") and para.lines:
+                boxes = [l.geometry.bounding_box for l in para.lines if l.HasField("geometry")]
+                if boxes:
+                    min_x = min(b.center_x - b.width / 2 for b in boxes)
+                    max_x = max(b.center_x + b.width / 2 for b in boxes)
+                    min_y = min(b.center_y - b.height / 2 for b in boxes)
+                    max_y = max(b.center_y + b.height / 2 for b in boxes)
+                    para.geometry.bounding_box.center_x = (min_x + max_x) / 2
+                    para.geometry.bounding_box.center_y = (min_y + max_y) / 2
+                    para.geometry.bounding_box.width = max(0.01, max_x - min_x)
+                    para.geometry.bounding_box.height = max(0.01, max_y - min_y)
 
         if tasks:
             translated_texts = await asyncio.gather(*tasks, return_exceptions=True)
             for p_idx, t_res in zip(para_indices, translated_texts):
-                if p_idx < len(raw_objs.deep_gleams) and raw_objs.deep_gleams[p_idx].HasField("translation"):
-                    fallback_lens = raw_objs.deep_gleams[p_idx].translation.translation
-                    text_to_polish = t_res if isinstance(t_res, str) and t_res else fallback_lens
-                    polished = polish_scanlation_text(text_to_polish, glossary)
+                para = raw_objs.text.text_layout.paragraphs[p_idx]
+                src = " ".join([word.plain_text for l in para.lines for word in l.words if word.plain_text]).strip()
+                if isinstance(t_res, str) and t_res.strip() and t_res.strip().lower() != src.lower():
+                    polished = polish_scanlation_text(t_res, glossary)
+                    while len(raw_objs.deep_gleams) <= p_idx:
+                        raw_objs.deep_gleams.add()
                     raw_objs.deep_gleams[p_idx].translation.translation = polished
-                    raw_objs.deep_gleams[p_idx].translation.writing_direction = 2  # Força reflow seguro
+                    raw_objs.deep_gleams[p_idx].translation.writing_direction = 2
                     raw_objs.deep_gleams[p_idx].translation.target_language = "pt"
+                    raw_objs.deep_gleams[p_idx].translation.status.code = 1
 
-                    # Assegura que o parágrafo tenha bounding box de geometria para reflow
-                    para = raw_objs.text.text_layout.paragraphs[p_idx]
-                    if not para.HasField("geometry") and para.lines:
-                        boxes = [l.geometry.bounding_box for l in para.lines if l.HasField("geometry")]
-                        if boxes:
-                            min_x = min(b.center_x - b.width / 2 for b in boxes)
-                            max_x = max(b.center_x + b.width / 2 for b in boxes)
-                            min_y = min(b.center_y - b.height / 2 for b in boxes)
-                            max_y = max(b.center_y + b.height / 2 for b in boxes)
-                            para.geometry.bounding_box.center_x = (min_x + max_x) / 2
-                            para.geometry.bounding_box.center_y = (min_y + max_y) / 2
-                            para.geometry.bounding_box.width = max(0.01, max_x - min_x)
-                            para.geometry.bounding_box.height = max(0.01, max_y - min_y)
+    async def _extract_nexus_chapter(self, url):
+        supabase_url = "https://supabase.nexusmangas.com"
+        anon_key = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc4NzgwMjAwMCwiZXhwIjo0OTQzNDc1NjAwLCJyb2xlIjoiYW5vbiJ9.Cnl8Jw2DeKe84OAkmJYfO33xlcZsw0TC2Nw_il0tpRs"
+        
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.strip('/')
+        parts = [p for p in path.split('/') if p]
+        
+        chapter_id = None
+        slug = None
+        numero = None
+        
+        if "read" in parts:
+            idx = parts.index("read")
+            if idx + 1 < len(parts):
+                chapter_id = parts[idx + 1]
+        elif "obra" in parts and "capitulo" in parts:
+            idx_o = parts.index("obra")
+            idx_c = parts.index("capitulo")
+            if idx_o + 1 < len(parts):
+                slug = parts[idx_o + 1]
+            if idx_c + 1 < len(parts):
+                numero = parts[idx_c + 1]
+        elif "capitulo" in parts:
+            idx_c = parts.index("capitulo")
+            if idx_c + 1 < len(parts):
+                slug = parts[idx_c + 1]
+            if idx_c + 2 < len(parts):
+                numero = parts[idx_c + 2]
+        elif "obra" in parts:
+            idx_o = parts.index("obra")
+            if idx_o + 1 < len(parts):
+                slug = parts[idx_o + 1]
+                numero = "1"
+                
+        work_title = None
+        work_id = None
+        
+        def _curl_json(endpoint, method="GET", body=None, extra_headers=None):
+            cmd = ["curl.exe", "-s", "-L"]
+            hdrs = {
+                "apikey": anon_key,
+                "Authorization": f"Bearer {anon_key}"
+            }
+            if extra_headers:
+                hdrs.update(extra_headers)
+            for k, v in hdrs.items():
+                cmd.extend(["-H", f"{k}: {v}"])
+            if method == "POST":
+                cmd.extend(["-X", "POST"])
+                if body:
+                    cmd.extend(["-H", "Content-Type: application/json", "-d", json.dumps(body)])
+            cmd.append(endpoint)
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+            if res.returncode == 0 and res.stdout:
+                try:
+                    return json.loads(res.stdout)
+                except Exception:
+                    pass
+            return None
+
+        if not chapter_id and slug and numero:
+            works = _curl_json(f"{supabase_url}/rest/v1/works?slug=eq.{slug}&select=id,title,slug")
+            if works and isinstance(works, list) and len(works) > 0:
+                work_id = works[0].get("id")
+                work_title = works[0].get("title")
+            
+            if work_id:
+                now_iso = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+                ch_url = f"{supabase_url}/rest/v1/chapters?work_id=eq.{work_id}&number=eq.{numero}&published_at=lte.{now_iso}&select=id,number,title&limit=1"
+                chapters = _curl_json(ch_url)
+                if chapters and isinstance(chapters, list) and len(chapters) > 0:
+                    chapter_id = chapters[0].get("id")
+
+        if not chapter_id:
+            return None
+
+        fn_res = _curl_json(
+            f"{supabase_url}/functions/v1/read-chapter",
+            method="POST",
+            body={"chapterId": chapter_id},
+            extra_headers={"x-nexus-client": "reader-v3"}
+        )
+
+        if not fn_res or not fn_res.get("success"):
+            return None
+
+        ch_data = fn_res.get("chapter", {})
+        pages = ch_data.get("pages", [])
+        cap_num = str(numero or ch_data.get("number", "1"))
+        
+        next_num = int(cap_num) + 1 if cap_num.isdigit() else None
+        prev_num = int(cap_num) - 1 if cap_num.isdigit() and int(cap_num) > 1 else None
+        
+        next_url = f"https://www.nexusmangas.com/capitulo/{slug}/{next_num}" if (next_num and slug) else None
+        prev_url = f"https://www.nexusmangas.com/capitulo/{slug}/{prev_num}" if (prev_num and slug) else None
+
+        return {
+            "series_slug": slug or "nexus-work",
+            "series_title": work_title or (slug or "").replace("-", " ").title(),
+            "chapter_num": cap_num,
+            "pages": pages,
+            "next_url": next_url,
+            "prev_url": prev_url,
+            "url": url
+        }
+
+    def _extract_scanmanga_chapter(self, url, dest_dir=None):
+        edge_paths = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            shutil.which("msedge") or "",
+            shutil.which("chrome") or ""
+        ]
+        edge_exe = next((p for p in edge_paths if p and os.path.exists(p)), None)
+        if not edge_exe:
+            return None
+
+        def _ws_connect(ws_url):
+            parts = ws_url.replace("ws://", "").split("/", 1)
+            host, port_str = parts[0].split(":")
+            path = "/" + parts[1]
+            s = socket.create_connection((host, int(port_str)), timeout=10)
+            key = base64.b64encode(os.urandom(16)).decode()
+            handshake = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port_str}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            s.sendall(handshake.encode())
+            res = s.recv(4096)
+            if not res.startswith(b"HTTP/1.1 101"):
+                raise RuntimeError(f"WebSocket upgrade failed: {res}")
+            return s
+
+        def _ws_send(s, data_dict):
+            payload = json.dumps(data_dict).encode("utf-8")
+            length = len(payload)
+            mask = os.urandom(4)
+            masked = bytearray(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if length <= 125:
+                header = bytes([0x81, 0x80 | length]) + mask
+            elif length <= 65535:
+                header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", length) + mask
+            else:
+                header = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", length) + mask
+            s.sendall(header + masked)
+
+        def _ws_recv(s):
+            b1, b2 = s.recv(2)
+            length = b2 & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", s.recv(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", s.recv(8))[0]
+            masked = (b2 & 0x80) != 0
+            mask = s.recv(4) if masked else None
+            payload = bytearray()
+            while len(payload) < length:
+                chunk = s.recv(min(length - len(payload), 65536))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if masked:
+                payload = bytearray(b ^ mask[i % 4] for i, b in enumerate(payload))
+            return json.loads(payload.decode("utf-8", errors="ignore"))
+
+        import time
+        port = 9330 + (int(time.time() * 100) % 500)
+        temp_dir = os.path.join(os.environ.get("TEMP", "C:\\Temp"), f"edge_sm_{port}")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        cmd = [
+            edge_exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={temp_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+            url
+        ]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            ws_url = None
+            for _ in range(25):
+                time.sleep(0.4)
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=2) as resp:
+                        targets = json.loads(resp.read().decode())
+                        for t in targets:
+                            if t.get("type") == "page" and "webSocketDebuggerUrl" in t:
+                                ws_url = t["webSocketDebuggerUrl"]
+                                break
+                        if ws_url:
+                            break
+                except Exception:
+                    pass
+
+            if not ws_url:
+                return None
+
+            s = _ws_connect(ws_url)
+            s.settimeout(5.0)
+
+            _ws_send(s, {"id": 1, "method": "Network.enable"})
+            _ws_send(s, {"id": 2, "method": "Page.enable"})
+
+            post_req_id = None
+            chapter_pages = []
+            raw_title = None
+
+            start_time = time.time()
+            while time.time() - start_time < 20:
+                try:
+                    msg = _ws_recv(s)
+                except socket.timeout:
+                    continue
+
+                method = msg.get("method", "")
+                params = msg.get("params", {})
+
+                if method == "Network.requestWillBeSent":
+                    req = params.get("request", {})
+                    req_url = req.get("url", "")
+                    if "/lel/" in req_url and req.get("method") == "POST":
+                        post_req_id = params.get("requestId")
+
+                elif method == "Network.loadingFinished" and post_req_id:
+                    if params.get("requestId") == post_req_id:
+                        _ws_send(s, {"id": 100, "method": "Network.getResponseBody", "params": {"requestId": post_req_id}})
+
+                elif msg.get("id") == 100:
+                    body_data = msg.get("result", {}).get("body", "").strip()
+                    if body_data:
+                        m_idc = re.search(r'_(\d+)\.html', url)
+                        idc = int(m_idc.group(1)) if m_idc else 0
+
+                        compressed = base64.b64decode(body_data)
+                        inflated = zlib.decompress(compressed).decode('latin1')
+                        hex_idc = hex(idc)[2:]
+                        cleaned = inflated[:-len(hex_idc)] if inflated.endswith(hex_idc) else inflated
+                        reversed_str = cleaned[::-1]
+                        padding = (-len(reversed_str)) % 4
+                        reversed_str_padded = reversed_str + ('=' * padding)
+                        data_obj = json.loads(base64.b64decode(reversed_str_padded).decode('utf-8', errors='ignore'))
+
+                        dN = data_obj.get("dN")
+                        base_url = f"https://{dN}/{data_obj.get('s')}/{data_obj.get('v')}/{data_obj.get('c')}"
+                        p = data_obj.get("p", {})
+                        for k in sorted(p.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+                            page = p[k]
+                            chapter_pages.append(f"{base_url}/{page['f']}.{page['e']}")
+
+                        _ws_send(s, {"id": 101, "method": "Runtime.evaluate", "params": {"expression": "document.title", "returnByValue": True}})
+
+                elif msg.get("id") == 101:
+                    raw_title = msg.get("result", {}).get("result", {}).get("value")
+                    break
+
+            if dest_dir and chapter_pages:
+                os.makedirs(dest_dir, exist_ok=True)
+                for idx, p_url in enumerate(chapter_pages):
+                    f_path = os.path.join(dest_dir, f"pagina_{idx+1:03d}.webp")
+                    if os.path.exists(f_path) and os.path.getsize(f_path) > 1000:
+                        continue
+                    expr = f"""(async () => {{
+                        const res = await fetch("{p_url}");
+                        const buf = await res.arrayBuffer();
+                        let binary = '';
+                        const bytes = new Uint8Array(buf);
+                        const len = bytes.byteLength;
+                        for (let i = 0; i < len; i++) {{
+                            binary += String.fromCharCode(bytes[i]);
+                        }}
+                        return btoa(binary);
+                    }})()"""
+                    _ws_send(s, {"id": 200 + idx, "method": "Runtime.evaluate", "params": {"expression": expr, "awaitPromise": True, "returnByValue": True}})
+                    while True:
+                        m = _ws_recv(s)
+                        if m.get("id") == 200 + idx:
+                            b64 = m.get("result", {}).get("result", {}).get("value")
+                            if b64:
+                                with open(f_path, "wb") as f:
+                                    f.write(base64.b64decode(b64))
+                            break
+
+            s.close()
+
+            m_slug = re.search(r'/lecture-en-ligne/(.*?)-Chapitre', url, re.I)
+            series_slug = m_slug.group(1).lower() if m_slug else "scanmanga-manga"
+            m_chap = re.search(r'Chapitre[-_ ](\d+)', url, re.I)
+            chapter_num = m_chap.group(1) if m_chap else "1"
+
+            clean_title = raw_title or ""
+            if "»" in clean_title:
+                clean_title = clean_title.split("»")[0].strip()
+            elif "Chapitre" in clean_title:
+                clean_title = clean_title.split("Chapitre")[0].strip()
+            if "|" in clean_title:
+                clean_title = clean_title.split("|")[0].strip()
+            clean_title = clean_title.strip(" -_") or series_slug.replace("-", " ").title()
+
+            return {
+                "series_slug": series_slug,
+                "series_title": clean_title,
+                "chapter_num": chapter_num,
+                "pages": chapter_pages,
+                "next_url": None,
+                "prev_url": None,
+                "url": url
+            }
+        except Exception as e:
+            print(f"[!] Erro no _extract_scanmanga_chapter: {e}")
+            return None
+        finally:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     async def extract_chapter_info(self, url, client=None):
         domain = urllib.parse.urlparse(url).netloc
+
+        # 0. Suporte dedicado a NexusMangas / NexusToons via backend Supabase
+        if any(d in domain.lower() for d in ["nexusmangas.com", "nexustoons.com"]):
+            try:
+                nexus_info = await self._extract_nexus_chapter(url)
+                if nexus_info and nexus_info.get("pages"):
+                    return nexus_info
+            except Exception as e:
+                print(f"[!] Erro no extrator Nexus: {e}")
+
+        # 0.1 Suporte dedicado a Scan-Manga via sessão DevTools (Cloudflare Turnstile)
+        if any(d in domain.lower() for d in ["scan-manga.com"]):
+            try:
+                sm_info = await asyncio.to_thread(self._extract_scanmanga_chapter, url)
+                if sm_info and sm_info.get("pages"):
+                    return sm_info
+            except Exception as e:
+                print(f"[!] Erro no extrator Scan-Manga: {e}")
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer": f"https://{domain}/" if domain else "https://kaynscans.com/"
         }
         
-        if client:
-            resp = await client.get(url, headers=headers, timeout=25.0)
-            html = resp.text
-        else:
-            async with httpx.AsyncClient() as c:
-                resp = await c.get(url, headers=headers, timeout=25.0)
+        def _curl_get(target_url, hdrs):
+            try:
+                cmd = ["curl.exe", "-s", "-L"]
+                for k, v in hdrs.items():
+                    cmd.extend(["-H", f"{k}: {v}"])
+                cmd.append(target_url)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+                if res.returncode == 0 and res.stdout and len(res.stdout) > 200:
+                    return res.stdout
+            except Exception:
+                pass
+            return ""
+
+        html = ""
+        try:
+            if client:
+                resp = await client.get(url, headers=headers, timeout=25.0)
+            else:
+                async with httpx.AsyncClient(follow_redirects=True) as c:
+                    resp = await c.get(url, headers=headers, timeout=25.0)
+            if resp.status_code == 200 and "Just a moment..." not in resp.text:
                 html = resp.text
+            else:
+                html = _curl_get(url, headers)
+        except Exception:
+            html = _curl_get(url, headers)
 
         # Extrai blocos Next.js
         chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL)
@@ -850,13 +1234,18 @@ class MangaEngine:
                 except Exception:
                     pass
 
-        # 3. Fallback: Suporte a Scrapers Universais (Madara, MangaDex, SSR tradicional)
+        # 3. Fallback: Suporte a Scrapers Universais (AstraToons, Madara, MangaDex, SSR tradicional)
         if not image_paths:
-            reader_areas = re.findall(r'(?:<div[^>]+id=["\']readerarea["\'][^>]*>|<div[^>]+class=["\'][^"\']*(?:reading-content|page-break|chapter-images|entry-content)[^"\']*["\'][^>]*>)(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
-            search_html = "".join(reader_areas) if reader_areas else html
-            candidates = re.findall(r'<img[^>]+(?:data-src|data-lazy-src|data-original|src)=["\']([^"\']+\.(?:webp|jpg|jpeg|png)(?:\?[^"\']*)?)["\']', search_html, re.IGNORECASE)
-            ignored_patterns = ['logo', 'avatar', 'icon', 'banner', 'discord', 'cover', 'favicon', 'badge', 'widget']
-            image_paths = [c.strip() for c in candidates if not any(ign in c.lower() for ign in ignored_patterns)]
+            # AstraToons e leitores com canvas/storage direto
+            storage_chaps = re.findall(r'<(?:img|canvas)[^>]+(?:data-src|src)=["\']([^"\']*/storage/chapters/[^"\']+)["\']', html, re.I)
+            if storage_chaps:
+                image_paths = storage_chaps
+            else:
+                reader_areas = re.findall(r'(?:<div[^>]+id=["\'](?:readerarea|reader-container)["\'][^>]*>|<div[^>]+class=["\'][^"\']*(?:reading-content|page-break|chapter-images|entry-content)[^"\']*["\'][^>]*>)(.*?)</div>', html, re.DOTALL | re.IGNORECASE)
+                search_html = "".join(reader_areas) if reader_areas else html
+                candidates = re.findall(r'<(?:img|canvas)[^>]+(?:data-src|data-lazy-src|data-original|src)=["\']([^"\']+\.(?:webp|jpg|jpeg|png)(?:\?[^"\']*)?)["\']', search_html, re.IGNORECASE)
+                ignored_patterns = ['logo', 'avatar', 'icon', 'banner', 'discord', 'cover', 'favicon', 'badge', 'widget', 'thumbnail']
+                image_paths = [c.strip() for c in candidates if not any(ign in c.lower() for ign in ignored_patterns)]
 
         seen = set()
         pages = []
@@ -874,12 +1263,15 @@ class MangaEngine:
             series_slug = series_match.group(1)
             series_title = series_match.group(2)
         else:
-            title_m = re.search(r'<title>(.*?)</title>', html, re.IGNORECASE)
+            all_titles = re.findall(r'<title>(.*?)</title>', html, re.IGNORECASE)
             clean_title = None
-            if title_m:
-                t_raw = title_m.group(1).split("-")[0].split("|")[0].split("Chapter")[0].split("Capítulo")[0].strip()
-                if t_raw and len(t_raw) > 2:
-                    clean_title = t_raw
+            for t in reversed(all_titles):
+                t_cand = t.split("-")[0].split("|")[0].split("Chapter")[0].split("Capítulo")[0].strip()
+                if t_cand and len(t_cand) > 2 and t_cand.lower() not in ["astratoons", "manga", "home", "leitor", "reader"]:
+                    clean_title = t_cand
+                    break
+            if not clean_title and all_titles:
+                clean_title = all_titles[-1].split("-")[0].split("|")[0].strip()
 
             parts = [p for p in urllib.parse.urlparse(url).path.split("/") if p]
             if parts:
@@ -935,8 +1327,27 @@ class MangaEngine:
                     with open(out_path, "wb") as f:
                         f.write(resp.content)
                     return out_path
+                elif resp.status_code in [403, 503]:
+                    # Bypass Cloudflare TLS fingerprint com curl nativo do Windows
+                    cmd = ["curl.exe", "-s", "-L"]
+                    for k, v in headers.items():
+                        cmd.extend(["-H", f"{k}: {v}"])
+                    cmd.extend(["-o", out_path, img_url])
+                    res = subprocess.run(cmd, capture_output=True)
+                    if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                        return out_path
             except Exception:
                 if attempt == retries - 1:
+                    try:
+                        cmd = ["curl.exe", "-s", "-L"]
+                        for k, v in headers.items():
+                            cmd.extend(["-H", f"{k}: {v}"])
+                        cmd.extend(["-o", out_path, img_url])
+                        res = subprocess.run(cmd, capture_output=True)
+                        if res.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                            return out_path
+                    except Exception:
+                        pass
                     raise
                 await asyncio.sleep(1.5)
         raise Exception(f"Falha no download após {retries} tentativas: {img_url}")
@@ -955,8 +1366,21 @@ class MangaEngine:
                 })
 
         report("running", "inspecting", 5, "Conectando ao site do mangá...")
-        info = await self.extract_chapter_info(url)
-        pages = info["pages"]
+        domain = urllib.parse.urlparse(url).netloc
+        if any(d in domain.lower() for d in ["scan-manga.com"]):
+            m_slug = re.search(r'/lecture-en-ligne/(.*?)-Chapitre', url, re.I)
+            s_slug = m_slug.group(1).lower() if m_slug else "scanmanga-manga"
+            m_chap = re.search(r'Chapitre[-_ ](\d+)', url, re.I)
+            c_num = m_chap.group(1) if m_chap else "1"
+            chapter_dir = os.path.join(self.data_dir, s_slug, f"capitulo_{c_num}")
+            pre_orig = os.path.join(chapter_dir, "original")
+            os.makedirs(pre_orig, exist_ok=True)
+            report("running", "inspecting", 8, "Bypassing proteção Cloudflare e carregando páginas...")
+            info = await asyncio.to_thread(self._extract_scanmanga_chapter, url, dest_dir=pre_orig)
+        else:
+            info = await self.extract_chapter_info(url)
+
+        pages = info["pages"] if info else []
         if not pages:
             report("error", "inspecting", 100, "Nenhuma página encontrada para este capítulo.")
             return None
@@ -986,6 +1410,9 @@ class MangaEngine:
             img_url = path if path.startswith("http") else f"https://{domain}{path}"
             filename = f"pagina_{i+1:03d}.webp"
             filepath = os.path.join(orig_dir, filename)
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
+                downloaded_paths[i] = filepath
+                return
             async with download_sem:
                 try:
                     await self.download_image(client, img_url, filepath, headers)
